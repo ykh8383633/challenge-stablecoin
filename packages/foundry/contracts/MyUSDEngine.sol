@@ -146,20 +146,107 @@ contract MyUSDEngine is Ownable {
 
         _validatePosition(msg.sender);
         i_myUSD.mintTo(msg.sender, mintAmount);
-        
+
         emit DebtSharesMinted(msg.sender, mintAmount, shares);
     }
 
     // Checkpoint 5: Accruing Interest & Managing Borrow Rates
-    function setBorrowRate(uint256 newRate) external onlyRateController { }
+    function setBorrowRate(uint256 newRate) external onlyRateController { 
+        _accrueInterest();
+        borrowRate = newRate;
+        emit BorrowRateUpdated(newRate);
+    }
 
     // Checkpoint 6: Repaying Debt & Withdrawing Collateral
-    function repayUpTo(uint256 amount) public { }
+    function repayUpTo(uint256 amount) public { 
+        uint amountInShares = _getMyUSDToShares(amount);
 
-    function withdrawCollateral(uint256 amount) external { }
+        if(amountInShares > s_userDebtShares[msg.sender]) {
+            amountInShares = s_userDebtShares[msg.sender];
+            amount = getCurrentDebtValue(msg.sender);
+        }
+
+        if(i_myUSD.balanceOf(msg.sender) < amount) {
+            revert MyUSD__InsufficientBalance();
+        }
+
+        if(i_myUSD.allowance(msg.sender, address(this)) < amount) {
+            revert MyUSD__InsufficientAllowance();
+        }
+
+        s_userDebtShares[msg.sender] -= amountInShares;
+        totalDebtShares -= amountInShares;
+
+        i_myUSD.burnFrom(msg.sender, amount);
+
+        emit DebtSharesBurned(msg.sender, amount, amountInShares);
+    }
+
+    function withdrawCollateral(uint256 amount) external { 
+        if(amount == 0) {
+            revert Engine__InvalidAmount();
+        }
+
+        if(s_userCollateral[msg.sender] < amount) {
+            revert Engine__InsufficientCollateral();
+        }
+
+        s_userCollateral[msg.sender] -= amount;
+
+        if(s_userDebtShares[msg.sender] > 0) {
+            _validatePosition(msg.sender);
+        }
+
+        (bool sent, ) = payable(msg.sender).call{ value: amount }("");
+        if(!sent) revert Engine__TransferFailed();
+
+        emit CollateralWithdrawn(msg.sender, amount, i_oracle.getETHMyUSDPrice());
+    }
 
     // Checkpoint 7: Liquidation - Enforcing System Stability
-    function isLiquidatable(address user) public view returns (bool) { }
+    function isLiquidatable(address user) public view returns (bool) { 
+        uint positionRatio = calculatePositionRatio(user);
 
-    function liquidate(address user) external { }
+        if(positionRatio * 100 < COLLATERAL_RATIO * PRECISION) {
+            return true;
+        }
+
+        return false;
+    }
+
+    function liquidate(address user) external { 
+        if(!isLiquidatable(user)) {
+            revert Engine__NotLiquidatable();
+        }
+
+        uint userDebtValue = getCurrentDebtValue(user);
+        uint userCollateral = s_userCollateral[user];
+        uint collateralValue = calculateCollateralValue(user);
+
+        if(i_myUSD.balanceOf(msg.sender) < userDebtValue) {
+            revert MyUSD__InsufficientBalance();
+        }
+
+        if(i_myUSD.allowance(msg.sender, address(this)) < userDebtValue) {
+            revert MyUSD__InsufficientAllowance();
+        }
+
+        i_myUSD.burnFrom(msg.sender, userDebtValue);
+        totalDebtShares -= s_userDebtShares[user];
+        s_userDebtShares[user] = 0;
+
+        uint collateralCoverDebt = (userDebtValue * userCollateral) / collateralValue;
+        uint rewardAmount = (collateralCoverDebt * LIQUIDATOR_REWARD) / 100;
+        uint amountForLiquidator = collateralCoverDebt + rewardAmount;
+
+        if(amountForLiquidator > userCollateral) {
+            amountForLiquidator = userCollateral;
+        }
+
+        s_userCollateral[user] -= amountForLiquidator;
+        (bool sent, ) = payable(msg.sender).call{ value: amountForLiquidator }("");
+        if(!sent) revert Engine__TransferFailed();
+
+        emit Liquidation(user, msg.sender, amountForLiquidator, userDebtValue, i_oracle.getETHMyUSDPrice());
+    }
 }
